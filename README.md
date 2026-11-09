@@ -2,7 +2,7 @@
 
 // Use an ableton push 1 to control synthesisers via DIN MIDI, without the need of a computer.
 
-Code transformed to teensy 4.1 to use two USB connections. No more DIN MIDI connection. Coult be made available again.
+Code transformed to teensy 4.1 to use two USB connections. No more DIN MIDI connection.
 
 New features
 - teensy 4.1 Code changes
