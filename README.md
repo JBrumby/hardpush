@@ -4,6 +4,10 @@
 
 Code transformed to teensy 4.1 to use two USB connections. No more DIN MIDI connection. Coult be made available again.
 
+New features
+- teensy 4.1 Code changes
+- teensy 4.1 eeprom simulation is not for numerous writing. Code transformed to sd-card-usage
+
 Original features supported:
 
 - Play notes in scale with velocity sensitive pads
