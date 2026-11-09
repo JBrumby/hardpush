@@ -1,17 +1,54 @@
-// 2 DO
+// hardpush.ino
+//
+// https://pushmod.blogspot.com/
 
 // - make the buttons more sensitive, sniff original sysex
 // - more efficient handeling of displaying input notes
 // - Make the display functions build on eachother
 
+// Set to 1 to print every incoming Push message to the Serial Monitor.
+#define PUSH_DEBUG 1
+
+// If pad/button LEDs don't light, the Push exposes its data on the other
+// virtual cable - change this 0 <-> 1. (Input works on either; only LED/display
+// OUTPUT needs the right cable.)
+const uint8_t PUSH_CABLE = 1;
+
+volatile uint32_t noteOnCount = 0;
+volatile uint32_t noteOffCount = 0;
 
 
-#include <MIDI.h>
-#include <Bounce2.h>
+
+#include <USBHost_t36.h>
+
+// #include <MIDI.h>
+//#include <Bounce2.h>
 #include <EEPROM.h>
+#include <SD.h>
+const int chipSelect = BUILTIN_SDCARD; // on-board SD
+const char* filename = "push1.bin";
+File config_file;
+bool sd_is_dirty = false;
 
-MIDI_CREATE_INSTANCE(HardwareSerial, Serial1,     midiUSB);
-MIDI_CREATE_INSTANCE(HardwareSerial, Serial2,    midiDIN);
+//#include <MicroConfig.h>
+// Config config(push1.cfg", &SD)
+
+#if !defined(USB_MIDI_SERIAL) && !defined(USB_MIDI) && !defined(USB_MIDI4) && \
+    !defined(USB_MIDI16) && !defined(USB_MIDI16_SERIAL) && !defined(USB_MIDI4_SERIAL)
+#warning "Set Tools > USB Type to a MIDI option (e.g. 'MIDI' or 'Serial + MIDI')."
+#endif
+
+// ---------------------------------------------------------------------------
+//  USB host + devices
+// ---------------------------------------------------------------------------
+USBHost     myusb;
+USBHub      hub1(myusb);
+MIDIDevice  pushMidi(myusb);
+
+bool pushReady = false;
+
+// MIDI_CREATE_INSTANCE(HardwareSerial, Serial1,     midiUSB); to PUsh 1
+// MIDI_CREATE_INSTANCE(HardwareSerial, Serial2,    midiDIN);  to Computer
 
 ///////////////////////////////////////////////////////////
 //
@@ -50,14 +87,27 @@ enum {
 };
 
 // SET A VALUE IN EEPROM
-void eepromSet(byte adress, byte value)
+void eepromSet(byte adress, byte value, bool set_dirty = true)
 {
-  EEPROM.update(adress, value);
+  if (PUSH_DEBUG) Serial.printf("SD-Card SET-value Address=%lu Value=%lu \n ", adress, value);
+  
+  // EEPROM.update(adress, value);
+  config_file.seek(adress);
+  config_file.write((uint8_t) value);
+  if (set_dirty) sd_is_dirty = true;
+  // config_file.flush(); in loop verlagert
 }
 // GET A VALUE FROM EEPROM
 byte eepromGet(byte adress, byte minValue = 0, byte maxValue = 255, byte defaultValue = 0)
 {
-  byte value = EEPROM.read(adress);
+  if (PUSH_DEBUG) Serial.printf("SD-Card GET-value Address=%lu Default_Value=%lu \n ", adress, defaultValue);
+  
+  // return defaultValue;  // NO WRITING. DISABLED
+  
+  // byte value = EEPROM.read(adress);
+  config_file.seek(adress);
+  byte value = config_file.read();
+  if (PUSH_DEBUG) Serial.printf("SD-Card GET-value Address=%lu Read_Value=%lu \n ", adress, value);
   if(value == defaultValue)
     return value;
   if(value < minValue || value > maxValue)
@@ -302,8 +352,8 @@ byte scalePresetScales[numberOfPages];
 // CONNECTED DEVICE DETECTION
 //
 ////////////////////////////////////////////////
-Bounce debouncer = Bounce();
-int devicePin = 2;
+// Bounce debouncer = Bounce();
+// int devicePin = 2;
 
 
 //////////////////////////////////////////////////
@@ -311,8 +361,8 @@ int devicePin = 2;
 // SYSEX DATA
 //
 /////////////////////////////////////////////////
-byte sysexUserModeMessage[] = {240, 71, 127, 21, 98, 0, 1, 0, 247};
-byte sysexPolyPressure[] = {240, 71, 127, 21, 92, 0, 1, 0, 247};
+byte sysexUserModeMessage[] = {240, 71, 127, 21, 98, 0, 1, 0, 247}; // https://pushmod.blogspot.com/ sagt etwas anderes! Dies soll Live-Mode sein
+byte sysexPolyPressure[] =    {240, 71, 127, 21, 92, 0, 1, 0, 247}; // Das wäre der Key aftertouch
 byte sysexChannelPressure[] = {240, 71, 127, 21, 92, 0, 1, 1, 247};
 
 byte displayBuffer[4][68];
@@ -325,6 +375,18 @@ byte sysexDisplayBuffer[77]={240, 71, 127, 21, 24, 0, 69, 0, //the outline for a
 247};
 
 byte padSenseSyssexLow[]= {240, 71, 127, 21, 93, 0, 32, 0, 0, 6, 13, 0, 0, 7, 8, 16, 0, 0, 1, 4, 12, 0, 8, 0, 0, 0, 1, 13, 4, 12, 0, 32, 0, 0, 0, 14, 10, 6, 0, 247}; //sniffed midi message for setting pad sensitivity to -9
+// Start Sysex : {240, 71, 127, 
+// AbletonID   = 21, 
+// Befehl Sensitivity: 93, 0, 32, 
+// off_treshold: 0, 0, 6, 13, 
+// on_treshold: 0, 0, 7, 8, 
+// gain: 16, 0, 0, 1, 4, 12, 0, 8, 
+// curve1: 0, 0, 0, 1, 13, 4, 12, 0, 
+// curve2: 32, 0, 0, 0, 14, 10, 6, 0, 
+// Sysex Ende: 247}; //sniffed midi message for setting pad sensitivity to -9
+
+
+
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -383,7 +445,9 @@ bool legalRange(byte value){ // Checks if a note request is within 0-127
 void killAllPressedNotesDIN(byte channel){ 
   for(int i=0;i<128;i++){
     if(pressedNotes[i])
-    midiDIN.sendNoteOff(i,0,channel);
+    // midiDIN.sendNoteOff(i,0,channel);
+    usbMIDI.sendNoteOff(i, 0, channel);
+    // usbMIDI.sendNoteOff(active[i].note, 0, active[i].channel);
   }
 }
 
@@ -420,12 +484,13 @@ void initPageSelectButtons(){
   }
 }
 
+// Zum Umschlaten der Scales werden Buttons benutzt
 void initScalePresetSelectButtons(){
   delay(displayBugDelay);
   for(int i=0;i<numberOfScalePresets;i++){
-    if(i==scalePresetIndex)
+    if(i==scalePresetIndex) // ausgeählter Preset?
       mySendControlChange(i+102,2);
-    else
+    else // nicht ausgewählter Preset
       mySendControlChange(i+102,1);
   }
 }
@@ -433,9 +498,13 @@ void initScalePresetSelectButtons(){
 
 void initPushSettings(){
   delay(30);
-  midiUSB.sendSysEx(9,sysexUserModeMessage,true);
-  //midiUSB.sendSysEx(9,sysexChannelPressure,true);
-  midiUSB.sendSysEx(40,padSenseSyssexLow,true);
+  // midiUSB.sendSysEx(9,sysexUserModeMessage,true);
+  ////midiUSB.sendSysEx(9,sysexChannelPressure,true);
+  // midiUSB.sendSysEx(40,padSenseSyssexLow,true);
+  delay(30);
+  pushMidi.sendSysEx(9, sysexUserModeMessage, true, PUSH_CABLE);
+  delay(30);
+  pushMidi.sendSysEx(40, padSenseSyssexLow, true, PUSH_CABLE);
   delay(30);
 }
 
@@ -537,7 +606,8 @@ void showDisplayRow(byte row){
   for(int i=0;i<68;i++){ // Fill the sysex with most recent data
     sysexDisplayBuffer[i+8] = displayBuffer[row][i];
   }
-  midiUSB.sendSysEx(77,sysexDisplayBuffer,true); //send it
+  // midiUSB.sendSysEx(77,sysexDisplayBuffer,true); //send it
+  pushMidi.sendSysEx(77,sysexDisplayBuffer,true,PUSH_CABLE); //send it
   delay(displayBugDelay);
 }
 
@@ -548,9 +618,10 @@ void showDisplayRow(byte row){
 ///////////////////////////////////////////////////////////////
 
 void MIDImessage(byte command, byte MIDInote, byte MIDIvelocity) {
-  Serial1.write(command);//send note on or note off command 
-  Serial1.write(MIDInote);//send most segnificant byte
-  Serial1.write(MIDIvelocity);//send least segnificant
+  pushMidi.send(command, MIDInote, MIDIvelocity, PUSH_CABLE); // ist PUSH_CABLE hier richtig???
+  //Serial1.write(command);//send note on or note off command 
+  //Serial1.write(MIDInote);//send most segnificant byte
+  //Serial1.write(MIDIvelocity);//send least segnificant
 }
 void mySendNoteOn(byte note, byte velocity){
   MIDImessage(144, note, velocity);
@@ -602,10 +673,17 @@ void setLayout(byte layoutIndex, byte pageIndex){
 
 void handleNoteOnUSB(byte channel, byte pitch, byte velocity)
 {
+  noteOnCount++;
+  //if (PUSH_DEBUG) Serial.println(F("callback: handleNoteOnUSB."));
+  if (PUSH_DEBUG) Serial.printf("NoteOn  ch=%u note=%u vel=%u cable=%u\n", channel, pitch, velocity, pushMidi.getCable());
   if(pitch>35 && pitch<100){
     byte note = pushButtonIndexToAbsoluteNote(pitch-36);
     if(legalRange(note)){
-      midiDIN.sendNoteOn(note,velocity,pageChannels[instrumentPageIndex]);
+      // midiDIN.sendNoteOn(note,velocity,pageChannels[instrumentPageIndex]);
+      velocity *= 10+10; 
+      if (velocity > 126) {velocity = 126;};
+      usbMIDI.sendNoteOn(note, velocity, pageChannels[instrumentPageIndex]);// channel); //pageChannels[instrumentPageIndex]);
+      // usbMIDI.sendNoteOff(active[i].note, 0, active[i].channel);
       pressedNotes[note]=true;
     }
     // if(internalFeedback)
@@ -615,10 +693,14 @@ void handleNoteOnUSB(byte channel, byte pitch, byte velocity)
 
 void handleNoteOffUSB(byte channel, byte pitch, byte velocity)
 {
+  noteOffCount++;
+  //if (PUSH_DEBUG) Serial.println(F("callback: handleNoteOffUSB"));
   if(pitch>35 && pitch<100){
     byte note = pushButtonIndexToAbsoluteNote(pitch-36);
     if(legalRange(note)){
-      midiDIN.sendNoteOff(note,0,pageChannels[instrumentPageIndex]);
+      // midiDIN.sendNoteOff(note,0,pageChannels[instrumentPageIndex]);
+      usbMIDI.sendNoteOn(note, 0, pageChannels[instrumentPageIndex]); // channel); // pageChannels[instrumentPageIndex]);
+      // usbMIDI.sendNoteOn(note, velocity, pageChannels[instrumentPageIndex]);
       pressedNotes[note]=false;
     }
     // if(internalFeedback)
@@ -628,22 +710,33 @@ void handleNoteOffUSB(byte channel, byte pitch, byte velocity)
 }
 
 void handleAfterTouchPolyUSB(byte channel, byte note, byte pressure){
-  midiDIN.sendAfterTouch(pressure, pageChannels[instrumentPageIndex]);
+  if (PUSH_DEBUG) Serial.printf("callback handleAfterTouchPolyUSB val=%u .\n", pressure);
+  // midiDIN.sendAfterTouch(pressure, pageChannels[instrumentPageIndex]);
+  usbMIDI.sendAfterTouchPoly((uint8_t)note, pressure, pageChannels[instrumentPageIndex]);
+  // usbMIDI.sendAfterTouchPoly((uint8_t)n, val, noteChannel);
 }
 
 void handleAfterTouchChannelUSB(byte channel, byte pressure){
-  midiDIN.sendAfterTouch(pressure, pageChannels[instrumentPageIndex]);
+  if (PUSH_DEBUG) Serial.printf("callback handleAfterTouchChannelUSB val=%u .\n", pressure);
+  // midiDIN.sendAfterTouch(pressure, pageChannels[instrumentPageIndex]);
+  usbMIDI.sendAfterTouch(pressure, pageChannels[instrumentPageIndex]);
+  // usbMIDI.sendAfterTouchPoly((uint8_t)note, pressure, pageChannels[instrumentPageIndex]);
   //mySendAfterTouch(pressure);
 }
 
 void handleControlChangeUSB(byte channel, byte control, byte value){
+  if (PUSH_DEBUG) Serial.printf("callback für CC. handleControlChangeUSB Chan=%lu CC=%lu, Val=%lu\n", channel, control, value);
+  
   //SUSTAIN PEDAL
   if(control==64){
-    midiDIN.sendControlChange(64,value,pageChannels[instrumentPageIndex]);
+    // midiDIN.sendControlChange(64,value,pageChannels[instrumentPageIndex]);
+    usbMIDI.sendControlChange(64, value, pageChannels[instrumentPageIndex]);
+    // usbMIDI.sendControlChange(c.ccNum, c.value, c.channel);
   }
 
   // OCTAVE CHANGE BUTTONS
   if(control==54 || control==55){
+    //if (PUSH_DEBUG) Serial.printf("callback CC: Octave change Button\n");
     killAllPressedNotesDIN(pageChannels[instrumentPageIndex]); // avoid hanging notes
     if(control==54 && value==127){
       pageOctaves[instrumentPageIndex]=constrain(pageOctaves[instrumentPageIndex]-1,0,8);
@@ -825,7 +918,7 @@ if(control==102 || control==103 || control==104 || control==105){
     killAllPressedNotesDIN(pageChannels[instrumentPageIndex]);
     if(value==127){
       scalePresetIndex=control-102;
-      eepromSet(SCALE_PRESET_EEPROM_ADRESS,scalePresetIndex);
+      eepromSet(SCALE_PRESET_EEPROM_ADRESS,scalePresetIndex, false);
     }
     addDisplayTop();
     addButtonLabelAndData(1, String("Mode"), nameOfScales[scalePresetScales[scalePresetIndex]]);
@@ -842,7 +935,7 @@ if(control==102 || control==103 || control==104 || control==105){
     killAllPressedNotesDIN(pageChannels[instrumentPageIndex]);
     if(value==127){
       instrumentPageIndex=control-106;
-      eepromSet(PAGE_EEPROM_ADRESS,instrumentPageIndex);
+      eepromSet(PAGE_EEPROM_ADRESS,instrumentPageIndex, false);
     }
     addDisplayTop();
     addButtonLabelAndData(5, String("Channel"), pageChannels[instrumentPageIndex]);
@@ -856,15 +949,18 @@ if(control==102 || control==103 || control==104 || control==105){
 }
 
 void handlePitchBendUSB(byte channel, int bend){
-  midiDIN.sendPitchBend(bend,pageChannels[instrumentPageIndex]);
+  // midiDIN.sendPitchBend(bend,pageChannels[instrumentPageIndex]);
+  usbMIDI.sendPitchBend(bend, channel);
+  if (PUSH_DEBUG) Serial.printf("Pitchbend val=%u .\n", bend);
 }
 
 ///////////////////////////////////////////////////////////////////
 //
-//CALLBACKS DIN MIDI
+//CALLBACKS DIN MIDI / Computer USB
 //
 ///////////////////////////////////////////////////////////////////
 
+// incouming midi messages light up the pad
 void handleNoteOnDIN(byte channel, byte pitch, byte velocity){
   if (channel == pageChannels[instrumentPageIndex]) {
     for(int i=0;i<64;i++){
@@ -894,27 +990,59 @@ void handleNoteOffDIN(byte channel, byte pitch, byte velocity){
 
 
 void setup() {
-  Serial1.begin(31250);
-  Serial2.begin(31250);
-  Serial1.flush();
-  Serial2.flush();
+///////// SD ////////////
+  if (!SD.begin(chipSelect)) {
+    Serial.println("SD-Card: initialization failed!");
+    return;
+  }
+  if (PUSH_DEBUG) Serial.println("SD-Card: initialization done.");
 
-  midiUSB.begin(1); //the push is always sending on channel 1
-  midiDIN.begin(MIDI_CHANNEL_OMNI);  //the midi din ports can send on any channel
-  midiUSB.turnThruOff();
-  midiDIN.turnThruOff();
+  // Datei einmalig zum Lesen UND Schreiben öffnen (ohne O_APPEND )
+  config_file = SD.open(filename, FILE_WRITE_BEGIN); 
+  if (!config_file) {
+    Serial.println("Datei konnte nicht geöffnet werden!");
+    return;
+  }
 
 
-  //attach callbacks
-  midiUSB.setHandleNoteOn(handleNoteOnUSB); // Listen for user input on the push
-  midiUSB.setHandleNoteOff(handleNoteOffUSB);
-  midiUSB.setHandleControlChange(handleControlChangeUSB);
-  midiUSB.setHandlePitchBend(handlePitchBendUSB);
+
+  // Serial1.begin(31250);
+  // Serial2.begin(31250);
+  // Serial1.flush();
+  // Serial2.flush();
+  Serial.begin(115200);
+  if (PUSH_DEBUG) Serial.println(F("Setup Teensy 0."));
+  // midiUSB.begin(1); //the push is always sending on channel 1
+  // midiDIN.begin(MIDI_CHANNEL_OMNI);  //the midi din ports can send on any channel
+  myusb.begin();
+
+  // midiUSB.turnThruOff();
+  // midiDIN.turnThruOff();
+
+
+
+
+
+  //attach callbacks for Push 1 on USB
+  //midiUSB.setHandleNoteOn(handleNoteOnUSB); // Listen for user input on the push
+  //midiUSB.setHandleNoteOff(handleNoteOffUSB);
+  //midiUSB.setHandleControlChange(handleControlChangeUSB);
+  //midiUSB.setHandlePitchBend(handlePitchBendUSB);
+  pushMidi.setHandleNoteOn(handleNoteOnUSB); // Listen for user input on the push
+  pushMidi.setHandleNoteOff(handleNoteOffUSB);
+  pushMidi.setHandleControlChange(handleControlChangeUSB); 
+  pushMidi.setHandlePitchChange(handlePitchBendUSB);
   //midiUSB.setHandleAfterTouchChannel(handleAfterTouchChannelUSB);
   //midiUSB.setHandleAfterTouchPoly(handleAfterTouchPolyUSB);
-
-  midiDIN.setHandleNoteOn(handleNoteOnDIN); // listen for note on/off feedback to visualize on the grid
-  midiDIN.setHandleNoteOff(handleNoteOffDIN);
+  pushMidi.setHandleAfterTouchChannel(handleAfterTouchChannelUSB);
+  pushMidi.setHandleAfterTouchPoly(handleAfterTouchPolyUSB);
+  
+  // reverse sending from Computer. lights up the pads.
+  // attach callbacks for DIN-Midi or Computer USB on Teensy 4.1
+  //midiDIN.setHandleNoteOn(handleNoteOnDIN); // listen for note on/off feedback to visualize on the grid
+  //midiDIN.setHandleNoteOff(handleNoteOffDIN);
+  usbMIDI.setHandleNoteOn(handleNoteOnDIN); // listen for note on/off feedback to visualize on the grid
+  usbMIDI.setHandleNoteOff(handleNoteOffDIN);
 
   //init display buffer
   for(int row=0;row<4;row++){
@@ -923,10 +1051,13 @@ void setup() {
     }
   }
 
+  if (PUSH_DEBUG) Serial.println(F("Setup Teensy 4."));
+
   // Init pressed notes memory
   for(int i=0;i<128;i++){
     pressedNotes[i] = false;
   }
+  if (PUSH_DEBUG) Serial.println(F("Setup Teensy 5."));
 
   //Load EEPROM SETTINGS
   instrumentPageIndex = eepromGet(PAGE_EEPROM_ADRESS,0,numberOfPages-1,0);
@@ -937,26 +1068,31 @@ void setup() {
     pageLayouts[i]=eepromGet(PAGE1_LAYOUT_EEPROM_ADRESS+i,0,numberOfLayouts-1,0);
     pageOctaves[i]=eepromGet(PAGE1_OCTAVE_EEPROM_ADRESS+i,0,8,3);
   }
+  if (PUSH_DEBUG) Serial.println(F("Setup Teensy 6."));
   for(int i=0;i<numberOfScalePresets;i++){
     scalePresetScales[i]= eepromGet(PRESET1_SCALE_EEPROM_ADRESS+i,0,numberOfScales-1,1);
     scalePresetTonics[i]=eepromGet(PRESET1_TONIC_EEPROM_ADRESS+i,0,11,0);
   }
-
+  if (PUSH_DEBUG) Serial.println(F("Setup Teensy 7."));
   //I don't understand why I need this shit, but without it I get some horrible note action
   killAllNotesUSB();
-
+  if (PUSH_DEBUG) Serial.println(F("Setup Teensy 8."));
   //make connected devices hot-swappable 
-  pinMode(devicePin, INPUT_PULLUP);
-  debouncer.attach(devicePin);  
-  debouncer.interval(50);
+  //pinMode(devicePin, INPUT_PULLUP);
+  // debouncer.attach(devicePin);  
+  // debouncer.interval(50);
 
-  //initial check for connected device
-  if ( debouncer.read() ){
-    initPushSettings();
-    initGrid();
-    initOtherButtons();
-    initDisplay();
-  }
+  // //initial check for connected device
+  // bool connected = (pushMidi.idVendor() != 0);
+  // if (connected && !pushReady) {
+  // // if ( debouncer.read() ){
+  //   initPushSettings();
+  //   initGrid();
+  //   initOtherButtons();
+  //   initDisplay();
+  // }
+
+
 
 }
 
@@ -967,16 +1103,43 @@ void setup() {
 ///////////////////////////////////////////////////////////////////
 
 void loop() {
+  // Serial.println(F("Living."));
+  myusb.Task();
+  // while (pushMidi.read(PUSH_CABLE)) { }   // dispatch all queued Push events to the callbacks
+  // zazze übergibt keinen Parameter
+  while (pushMidi.read()) {};
+  while (usbMIDI.read())  { };   // drain the iPad side
 
-  midiUSB.read();
-  midiDIN.read();
-  debouncer.update();
-  if ( debouncer.rose() ){ //If a device was just connected, initialize it
+  // midiUSB.read();
+  // midiDIN.read();
+  // debouncer.update();
+  static uint32_t lastPrint = 0;
+  if (millis() - lastPrint > 2000) {
+    lastPrint = millis();
+    //Serial.printf("NoteOn=%lu  NoteOff=%lu\n", noteOnCount, noteOffCount);
+}
+  
+  // if ( debouncer.rose() ){ //If a device was just connected, initialize it
+  bool connected = (pushMidi.idVendor() != 0);
+  if (connected && !pushReady) {
+    if (PUSH_DEBUG) Serial.println(F("Push connected."));
     initPushSettings();
     initGrid();
     initOtherButtons();
     initDisplay();
+    pushReady = true;
 
+  } else if (!connected && pushReady) {
+    pushReady = false;
+    if (PUSH_DEBUG) Serial.println(F("Push disconnected."));
   }
+
+  if (!SD.sdfs.card()->isBusy() && sd_is_dirty) {
+    // Die SD-Karte ist bereit – jetzt kann geschrieben werden
+    config_file.flush();
+    sd_is_dirty = false;
+    if (PUSH_DEBUG) Serial.println("SD-Card: flush() augerufen.");
+  }
+
 }
 
